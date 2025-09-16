@@ -1,0 +1,691 @@
+#include <SPI.h>
+#include <lvgl.h>
+#include <Wire.h>
+#include <lorawan.h>
+#include <TFT_eSPI.h>
+#include "OneButton.h"
+#include <TinyGPSPlus.h>
+#include <SoftwareSerial.h>
+#include <AntaresESPHTTP.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_MPU6050.h>
+#include <Fall_Detection_Model_inferencing.h>
+
+// PIN DEFINITION
+#define PIN_BAT_VOLT 4
+#define PIN_BTN_L 0
+#define PIN_BTN_R 47
+#define PIN_LCD_BL 10
+
+#define IMU_SDA 16
+#define IMU_SCL 39
+
+#define GPS_RX 18
+#define GPS_TX 17
+
+const sRFM_pins RFM_pins = {
+    .CS = 34,
+    .RST = 33,
+    .DIO0 = 38,
+    .DIO1 = 48,
+};
+
+// GPS Variables
+TinyGPSPlus gps;
+SoftwareSerial ss(GPS_RX, GPS_TX);
+float latitude = 0.0, longitude = 0.0;
+int hour, minute;
+unsigned int transmission = 0;          // How many GPS data has been sent
+const unsigned long GPSinterval = 5000; // 5s interval to send message GPS data
+unsigned long GPSpreviousMillis = 0;    // will store last time message sent
+
+// Fall and Faint Detection Variables
+Adafruit_MPU6050 myIMU;
+float ax, ay, az;
+int fallCounter;
+
+String inferencingResult = "";
+#define FREQUENCY_HZ EI_CLASSIFIER_FREQUENCY
+#define INTERVAL_MS (1000 / (FREQUENCY_HZ + 1))
+float features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+size_t feature_ix = 0;
+
+#define FAINT_CHECK_DURATION_MS 30000 // Duration for faint check in milliseconds
+volatile int faintWatch = 0;          // Global variable to trigger faint check
+
+// Antares LoRaWAN
+SPIClass loraSPI(VSPI); // Create a new SPI instance for LoRa
+const char *devAddr = "eb56ad41";
+const char *nwkSKey = "c54480b0119182c69b5867fc9046233a";
+const char *appSKey = "6b15dcf8e8686605d6a42f52a5f74c35";
+
+const unsigned long LoRainterval = 10000; // interval to send LoRa message
+unsigned long LoRapreviousMillis = 0;     // will store last time message sent
+volatile int sendRequest = 0;
+
+char myStr[50];
+byte outStr[255];
+byte recvStatus = 0;
+int port, channel, freq;
+bool newmessage = false;
+float LoRalat = 0.0, LoRalon = 0.0;
+String LoRatime = "N/A";
+String GPStime = "N/A";
+
+// Antares HTTP
+#define ACCESSKEY "958a12ce6d1be97d:f23149f4927ba5ba" // Replace with your Antares account access key
+#define WIFISSID "BenS9"                              // Replace with your Wi-Fi SSID
+#define PASSWORD "fqkj4876"                           // Replace with your Wi-Fi password
+
+#define projectName "SafeTrack" // Replace with the Antares application name that was created
+#define deviceName "ChildGPS"   // Replace with the Antares device name that was created
+AntaresESPHTTP antares(ACCESSKEY);
+
+// LVGL Variables
+static const uint16_t screenWidth = 128;
+static const uint16_t screenHeight = 128;
+lv_obj_t *label;
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf[screenWidth * 10];
+TFT_eSPI tft = TFT_eSPI(screenWidth, screenHeight); /* TFT instance */
+
+// General Functions
+OneButton btn_left(PIN_BTN_L, true);
+OneButton btn_right(PIN_BTN_R, true);
+volatile int wifiConnected = 0;
+
+// Pickup Notification Variables
+volatile int isArrived = 0;
+
+#if LV_USE_LOG != 0
+/* Serial debugging */
+void my_print(const char *buf)
+{
+    Serial.printf(buf);
+    Serial.flush();
+}
+#endif
+
+/* Display flushing */
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
+{
+    uint32_t w = (area->x2 - area->x1 + 1);
+    uint32_t h = (area->y2 - area->y1 + 1);
+
+    tft.startWrite();
+    tft.setAddrWindow(area->x1, area->y1, w, h);
+    tft.pushColors((uint16_t *)&color_p->full, w * h, false);
+    tft.endWrite();
+
+    lv_disp_flush_ready(disp);
+}
+
+void sendAlert(String type)
+{
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        antares.add("data", "lat", latitude);
+        antares.add("data", "lon", longitude);
+        antares.add("data", "t", GPStime.c_str());
+        antares.add("data", "type", type);
+        antares.send(projectName, "FallAlert");
+    }
+}
+
+void faintCheck(void *pvParameters)
+{
+    const float JERK_THRESHOLD = 35;    // Adjust based on your application
+    const int SAMPLE_INTERVAL_MS = 100; // Sampling interval
+    unsigned long startTime = millis();
+    bool fainted = true;
+
+    // Previous acceleration values
+    float prevAccX = 0.0, prevAccY = 0.0, prevAccZ = 0.0, jerkX = 0.0, jerkY = 0.0, jerkZ = 0.0;
+
+    // Serial.println("Faint Check Task started.");
+
+    while (1)
+    {
+        float acceleration_g_x = ax;
+        float acceleration_g_y = ay;
+        float acceleration_g_z = az;
+
+        if (prevAccX == 0.0 && prevAccY == 0.0 && prevAccZ == 0.0)
+        {
+            prevAccX = acceleration_g_x;
+            prevAccY = acceleration_g_y;
+            prevAccZ = acceleration_g_z;
+
+            // Calculate jerk (change in acceleration over time)
+            jerkX = (acceleration_g_x - prevAccX) / (SAMPLE_INTERVAL_MS / 1000.0);
+            jerkY = (acceleration_g_y - prevAccY) / (SAMPLE_INTERVAL_MS / 1000.0);
+            jerkZ = (acceleration_g_z - prevAccZ) / (SAMPLE_INTERVAL_MS / 1000.0);
+        }
+        else
+        {
+            // Calculate jerk (change in acceleration over time)
+            jerkX = (acceleration_g_x - prevAccX) / (SAMPLE_INTERVAL_MS / 1000.0);
+            jerkY = (acceleration_g_y - prevAccY) / (SAMPLE_INTERVAL_MS / 1000.0);
+            jerkZ = (acceleration_g_z - prevAccZ) / (SAMPLE_INTERVAL_MS / 1000.0);
+
+            // Update previous acceleration values
+            prevAccX = acceleration_g_x;
+            prevAccY = acceleration_g_y;
+            prevAccZ = acceleration_g_z;
+        }
+        // Calculate the magnitude of jerk
+        float jerkMagnitude = sqrt(jerkX * jerkX + jerkY * jerkY + jerkZ * jerkZ);
+
+        // Serial.print("Jerk Magnitude: ");
+        // Serial.println(jerkMagnitude);
+
+        // Check if the jerk magnitude exceeds the threshold
+        if (jerkMagnitude > JERK_THRESHOLD)
+        {
+            // Serial.println("Significant movement detected. Resetting faintWatch to 0.");
+            faintWatch = 0;
+            vTaskDelete(NULL); // Stop the task
+        }
+
+        // Check if 60 seconds have passed
+        if (millis() - startTime >= FAINT_CHECK_DURATION_MS)
+        {
+            // Serial.println("No significant movement detected for 60 seconds. User has fainted.");
+            sendAlert("pingsan");
+            faintWatch = 0;    // Reset faintWatch after the check
+            vTaskDelete(NULL); // Stop the task
+        }
+
+        // Wait for the next sample
+        vTaskDelay(SAMPLE_INTERVAL_MS / portTICK_PERIOD_MS);
+    }
+}
+
+// Monitor task to detect faintWatch activation
+void monitorFaintWatch(void *pvParameters)
+{
+    while (1)
+    {
+        if (faintWatch == 1)
+        {
+            // Serial.println("faintWatch set to 1. Waiting for 6 seconds...");
+            vTaskDelay(6000 / portTICK_PERIOD_MS); // Wait for 6 seconds
+
+            // Create the faintCheck task
+            xTaskCreatePinnedToCore(
+                faintCheck,   // Task function
+                "FaintCheck", // Task name
+                4096,         // Stack size in words
+                NULL,         // Task parameters
+                1,            // Task priority
+                NULL,         // Task handle
+                1);
+
+            // Reset faintWatch to prevent multiple triggers
+            faintWatch = 0;
+        }
+
+        // Yield to other tasks
+        vTaskDelay(5000 / portTICK_PERIOD_MS); // Check faintWatch every 100ms
+    }
+}
+
+void imuTask(void *pvParameters)
+{
+    unsigned long last_interval_ms = 0;
+
+    for (;;)
+    {
+        // Check if it's time to sample
+        if (millis() - last_interval_ms >= INTERVAL_MS)
+        {
+            last_interval_ms = millis();
+
+            // Read accelerometer data
+            sensors_event_t a, g, temp;
+            myIMU.getEvent(&a, &g, &temp);
+
+            ax = a.acceleration.x;
+            ay = a.acceleration.y;
+            az = a.acceleration.z;
+
+            // Add accelerometer data to features buffer
+            features[feature_ix++] = -ay;
+            features[feature_ix++] = ax;
+            features[feature_ix++] = az;
+
+            // Check if features buffer is full
+            if (feature_ix == EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE)
+            {
+                ei_impulse_result_t result;
+
+                // Create the signal for inference
+                signal_t signal;
+                numpy::signal_from_buffer(features, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
+
+                // Run inference
+                EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
+
+                if (res != 0)
+                    return;
+
+                // Find the label with the highest probability
+                float maxValue = 0.0f;
+                int maxIndex = 0;
+
+                for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++)
+                {
+                    if (result.classification[ix].value > maxValue)
+                    {
+                        maxValue = result.classification[ix].value;
+                        maxIndex = ix;
+                    }
+                }
+
+                // Update the global variable with the highest-valued label
+                inferencingResult = result.classification[maxIndex].label;
+                if (inferencingResult == "Fall")
+                {
+                    fallCounter++;
+                    if (fallCounter == 1)
+                    {
+                        sendAlert("jatuh");
+                        fallCounter = 0;
+                        faintWatch = 1;
+                    }
+                }
+                else
+                {
+                    fallCounter = 0;
+                }
+                feature_ix = 0;
+            }
+        }
+        // Allow other tasks to run
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+}
+
+// Function to check if a given time falls within a specified range
+bool isTimeInRange(int currentHour, int currentMinute, int startHour, int startMinute, int endHour, int endMinute)
+{
+    // Convert times to "minutes since midnight" for easier comparison
+    int currentTimeInMinutes = currentHour * 60 + currentMinute;
+    int startTimeInMinutes = startHour * 60 + startMinute;
+    int endTimeInMinutes = endHour * 60 + endMinute;
+
+    // Check if the current time falls within the range
+    return (currentTimeInMinutes >= startTimeInMinutes && currentTimeInMinutes <= endTimeInMinutes);
+}
+
+void checkArrivalTask(void *pvParameters)
+{
+    int startHour = 00;
+    int startMinute = 30;
+    int endHour = 14;
+    int endMinute = 00;
+
+    for (;;)
+    {
+        if (isTimeInRange(hour, minute, startHour, startMinute, endHour, endMinute))
+        {
+            if (WiFi.status() == WL_CONNECTED)
+            {
+                antares.get(projectName, "PickupNotification");
+                if (antares.getSuccess())
+                {
+                    String received = antares.getString("location");
+                    if (received == "Arrived")
+                    {
+                        isArrived = 1;
+                    }
+                }
+            }
+        }
+        vTaskDelay(10000 / portTICK_PERIOD_MS);
+    }
+}
+
+void sendLoRaGPS(void *pvParameters)
+{
+    for (;;)
+    {
+        if (sendRequest == 1 && millis() - LoRapreviousMillis > LoRainterval)
+        {
+            LoRapreviousMillis = millis();
+            sendRequest = 0;
+            transmission++;
+            sprintf(myStr, "{\"lat\":%.6f,\"lon\":%.6f,\"t\":\"%s\"}", LoRalat, LoRalon, LoRatime.c_str());
+            lora.sendUplink(myStr, strlen(myStr), 0);
+            port = lora.getFramePortTx();
+            channel = lora.getChannel();
+            freq = lora.getChannelFreq(channel);
+        }
+        // Check Lora RX
+        lora.update();
+
+        recvStatus = lora.readDataByte(outStr);
+        if (recvStatus)
+        {
+            newmessage = true;
+            int counter = 0;
+            port = lora.getFramePortRx();
+            channel = lora.getChannelRx();
+            freq = lora.getChannelRxFreq(channel);
+
+            for (int i = 0; i < recvStatus; i++)
+            {
+                if (((outStr[i] >= 32) && (outStr[i] <= 126)) || (outStr[i] == 10) || (outStr[i] == 13))
+                    counter++;
+            }
+            if (port != 0)
+            {
+                if (counter == recvStatus)
+                {
+                    Serial.print(F("Received String : "));
+                    for (int i = 0; i < recvStatus; i++)
+                    {
+                        Serial.print(char(outStr[i]));
+                    }
+                }
+                else
+                {
+                    Serial.print(F("Received Hex: "));
+                    for (int i = 0; i < recvStatus; i++)
+                    {
+                        Serial.print(outStr[i], HEX);
+                        Serial.print(" ");
+                    }
+                }
+            }
+            else
+            {
+                Serial.print(F("Received Mac Cmd : "));
+                for (int i = 0; i < recvStatus; i++)
+                {
+                    Serial.print(outStr[i], HEX);
+                    Serial.print(" ");
+                }
+            }
+        }
+        vTaskDelay(5000 / portTICK_PERIOD_MS); // Delay for 5 seconds
+    }
+}
+
+void acknowledge()
+{
+    if (isArrived == 1)
+    {
+        isArrived = 0;
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            antares.add("location", "acknowledged");
+            antares.send(projectName, "PickupNotification");
+        }
+    }
+}
+
+void feedGPSTask(void *pvParameters)
+{
+    for (;;)
+    {
+        unsigned long start = millis();
+        // do{
+        while (ss.available())
+        {
+            char c = ss.read();
+            gps.encode(c);
+            // Serial.print(c); // Debug line to print raw GPS data
+        }
+        vTaskDelay(100 / portTICK_PERIOD_MS); // Delay for 100 miliseconds
+    }
+}
+
+void gpsTask(void *pvParameters)
+{
+    // Variables to store the last three sets of latitude and longitude values
+    float lastLat[3] = {0.0, 0.0, 0.0};
+    float lastLon[3] = {0.0, 0.0, 0.0};
+    int sameDataCount = 0;
+    for (;;)
+    {
+        if (gps.location.isUpdated())
+        {
+            latitude = gps.location.lat();
+            longitude = gps.location.lng();
+        }
+
+        if (gps.time.isValid())
+        {
+            hour = gps.time.hour();
+            minute = gps.time.minute();
+            int second = gps.time.second();
+
+            // Adjust to GMT+7
+            hour += 7;
+            if (hour >= 24)
+            {
+                hour -= 24;
+            }
+
+            GPStime = String(hour) + ":" + String(minute) + ":" + String(second);
+        }
+        else
+        {
+            GPStime = "N/A";
+        }
+
+        if (millis() - GPSpreviousMillis > GPSinterval)
+        {
+            GPSpreviousMillis = millis();
+            // Check if the current data matches the previous three sets
+            if (latitude == lastLat[0] && latitude == lastLat[1] && latitude == lastLat[2] &&
+                longitude == lastLon[0] && longitude == lastLon[1] && longitude == lastLon[2])
+            {
+                sameDataCount++;
+            }
+            else
+            {
+                sameDataCount = 0;
+            }
+
+            // If the data is the same three times in a row, skip sending
+            if (sameDataCount < 3 && latitude != 0.0 && longitude != 0.0)
+            {
+                if (WiFi.status() != WL_CONNECTED && sendRequest != 1)
+                {
+                    LoRalat = latitude;
+                    LoRalon = longitude;
+                    LoRatime = GPStime;
+                    if (sendRequest != 1)
+                        sendRequest = 1;
+                }
+                else
+                {
+                    antares.add("data", "lat", latitude);
+                    antares.add("data", "lon", longitude);
+                    antares.add("data", "t", GPStime.c_str());
+                    antares.send(projectName, deviceName);
+                    transmission++;
+                }
+
+                // Update the last three sets of latitude and longitude values
+                lastLat[2] = lastLat[1];
+                lastLat[1] = lastLat[0];
+                lastLat[0] = latitude;
+
+                lastLon[2] = lastLon[1];
+                lastLon[1] = lastLon[0];
+                lastLon[0] = longitude;
+            }
+        }
+        vTaskDelay(1000 / portTICK_PERIOD_MS); // Delay for 1000 ms
+    }
+}
+
+void displayTask(void *pvParameters)
+{
+    for (;;)
+    {
+        wifiConnected = WiFi.status() == WL_CONNECTED ? 1 : 0;
+        float volt = (analogRead(PIN_BAT_VOLT) * 2 * 3.3) / 4096;
+
+        lv_label_set_text_fmt(label, "%.2f %.2f %.2f\nval:%s\nLat:%.6f\nLon:%.6f\nTime:%s\nbat:%.2fv wifi:%d\nsent:%d Arrived:%d\n fwatch:%d", 
+        ax, ay, az, inferencingResult.c_str(), latitude, longitude, GPStime.c_str(), volt, wifiConnected, transmission, isArrived, faintWatch);
+
+        lv_timer_handler();                   /* let the GUI do its work */
+        vTaskDelay(100 / portTICK_PERIOD_MS); // Update display every 100 ms
+    }
+}
+
+void go_to_sleep(void)
+{
+    Serial.println("sleep");
+
+    // High level off the backlight
+    digitalWrite(PIN_LCD_BL, HIGH);
+    // Enable backlight hold on high level
+    gpio_hold_en((gpio_num_t)PIN_LCD_BL);
+
+    // IO47 cannot be set to the source of the awakening,
+    // and can only be set to GPIO0 as the keys to wake the source
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 6)
+    esp_sleep_enable_ext1_wakeup(GPIO_SEL_0, ESP_EXT1_WAKEUP_ANY_LOW);
+#else
+    esp_sleep_enable_ext1_wakeup(GPIO_SEL_0, ESP_EXT1_WAKEUP_ALL_LOW);
+#endif
+
+    esp_deep_sleep_start();
+}
+
+void setup()
+{
+    Serial.begin(115200);
+
+    gpio_hold_dis((gpio_num_t)PIN_LCD_BL);
+    pinMode(PIN_BAT_VOLT, ANALOG);
+    btn_left.attachClick(go_to_sleep);
+    btn_right.attachClick(acknowledge);
+
+    antares.wifiConnection(WIFISSID, PASSWORD);
+    antares.setDebug(false);
+
+    Wire.begin(IMU_SDA, IMU_SCL);
+    if (!myIMU.begin())
+    {
+        Serial.println("Failed to find MPU6050 chip");
+        while (1)
+        {
+            delay(10);
+        }
+    }
+    myIMU.setFilterBandwidth(MPU6050_BAND_10_HZ);
+    myIMU.setAccelerometerRange(MPU6050_RANGE_8_G);
+    Serial.println(F("MPU6050 initialized"));
+
+    // Initialize LVGL
+    lv_init();
+    tft.begin();
+    tft.setRotation(1);
+    lv_disp_draw_buf_init(&draw_buf, buf, NULL, screenWidth * 10);
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = screenWidth;
+    disp_drv.ver_res = screenHeight;
+    disp_drv.flush_cb = my_disp_flush;
+    disp_drv.draw_buf = &draw_buf;
+    lv_disp_drv_register(&disp_drv);
+    label = lv_label_create(lv_scr_act());
+    lv_label_set_text(label, "MPU6050 and GPS Data");
+
+    // Initialize GPS
+    ss.begin(9600);
+
+    loraSPI.begin(36, 37, 35); // SCK, MISO, MOSI for LoRa
+    delay(2000);
+    if (!lora.init())
+    {
+        Serial.println("RFM95 not detected");
+        delay(5000);
+        return;
+    }
+
+    lora.setDeviceClass(CLASS_A);
+    lora.setDataRate(SF10BW125);
+    lora.setFramePortTx(5);
+    lora.setChannel(MULTI);
+    lora.setTxPower(15);
+    lora.setNwkSKey(nwkSKey);
+    lora.setAppSKey(appSKey);
+    lora.setDevAddr(devAddr);
+
+    // Create tasks
+    xTaskCreatePinnedToCore(
+        sendLoRaGPS,   // Function to implement the task
+        "SendLoRaGPS", // Name of the task
+        4096,          // Stack size in words
+        NULL,          // Task input parameter
+        2,             // Priority of the task
+        NULL,          // Task handle
+        1);            // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        checkArrivalTask,   // Function to implement the task
+        "CheckArrivalTask", // Name of the task
+        4096,               // Stack size in words
+        NULL,               // Task input parameter
+        2,                  // Priority of the task
+        NULL,               // Task handle
+        0);                 // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        displayTask,   // Function to implement the task
+        "DisplayTask", // Name of the task
+        3048,          // Stack size in words
+        NULL,          // Task input parameter
+        1,             // Priority of the task
+        NULL,          // Task handle
+        0);            // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        imuTask,   // Function to implement the task
+        "IMUTask", // Name of the task
+        4096,      // Stack size in words
+        NULL,      // Task input parameter
+        3,         // Priority of the task
+        NULL,      // Task handle
+        1);        // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        gpsTask,   // Function to implement the task
+        "GPSTask", // Name of the task
+        4096,      // Stack size in words
+        NULL,      // Task input parameter
+        3,         // Priority of the task
+        NULL,      // Task handle
+        0);        // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        feedGPSTask, // Function to implement the task
+        "Feed GPS",  // Name of the task
+        4096,        // Stack size in words
+        NULL,        // Task input parameter
+        4,           // Priority of the task
+        NULL,        // Task handle
+        0);          // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        monitorFaintWatch,         // Task function
+        "Monitor FaintWatch Task", // Task name
+        1024,                      // Stack size in words
+        NULL,                      // Task parameters
+        1,                         // Task priority
+        NULL,                      // Task handle
+        1);
+}
+
+void loop()
+{
+    btn_left.tick();
+    btn_right.tick();
+}

@@ -1,0 +1,413 @@
+#include <SPI.h>
+#include <lorawan.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+#include <lvgl.h>
+#include <TFT_eSPI.h>
+#include <TinyGPSPlus.h>
+#include <SoftwareSerial.h>
+#include <AntaresESPHTTP.h>
+#include "OneButton.h"
+
+// ABP Credentials
+const char *devAddr = "0e9afe87";
+const char *nwkSKey = "958a12ce6d1be97d0000000000000000";
+const char *appSKey = "0000000000000000f23149f4927ba5ba";
+
+const unsigned long interval = 5000;    // 5s interval to send message
+unsigned long previousMillis = 0;       // will store last time message sent
+unsigned int transmission = 0;          // message counter
+
+char myStr[50];
+byte outStr[255];
+byte recvStatus = 0;
+int port, channel, freq;
+bool newmessage = false;
+int isArrived = 0;
+
+const sRFM_pins RFM_pins = {
+  .CS = 34,
+  .RST = 33,
+  .DIO0 = 38,
+  .DIO1 = 48,
+};
+
+#define PIN_BTN_L            0
+#define PIN_BTN_R            47
+#define IMU_SDA 16
+#define IMU_SCL 39
+#define GPS_RX 18
+#define GPS_TX 17
+#define PIN_BAT_VOLT 4
+#define ACCESSKEY "958a12ce6d1be97d:f23149f4927ba5ba"       // Replace with your Antares account access key
+#define WIFISSID "BenS9"                                    // Replace with your Wi-Fi SSID
+#define PASSWORD "fqkj4876"                                 // Replace with your Wi-Fi password
+
+#define projectName "TestingGround"                         // Replace with the Antares application name that was created
+#define deviceName "ESP32-S3"                               // Replace with the Antares device name that was created
+
+AntaresESPHTTP antares(ACCESSKEY);
+Adafruit_MPU6050 myIMU;
+TinyGPSPlus gps;
+lv_obj_t *label;
+OneButton btn_left(PIN_BTN_L, true);
+OneButton btn_right(PIN_BTN_R, true);
+
+// The serial connection to the GPS device
+SoftwareSerial ss(GPS_RX, GPS_TX);
+
+// Global variable to store connection status
+volatile int wifiConnected = 0; // 1: Connected, 0: Not Connected
+
+/*Change to your screen resolution*/
+static const uint16_t screenWidth = 128;
+static const uint16_t screenHeight = 128;
+
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf[screenWidth * 10];
+
+TFT_eSPI tft = TFT_eSPI(screenWidth, screenHeight); /* TFT instance */
+
+SPIClass loraSPI(VSPI); // Create a new SPI instance for LoRa
+
+// Global variables for sharing data between tasks
+float ax, ay, az, volt;
+float latitude = 0.0, longitude = 0.0;
+String GPStime = "N/A";
+
+#if LV_USE_LOG != 0
+/* Serial debugging */
+void my_print(const char *buf)
+{
+    Serial.printf(buf);
+    Serial.flush();
+}
+#endif
+
+/* Display flushing */
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
+{
+    uint32_t w = (area->x2 - area->x1 + 1);
+    uint32_t h = (area->y2 - area->y1 + 1);
+
+    tft.startWrite();
+    tft.setAddrWindow(area->x1, area->y1, w, h);
+    tft.pushColors((uint16_t *)&color_p->full, w * h, false);
+    tft.endWrite();
+
+    lv_disp_flush_ready(disp);
+}
+
+// Define a function to check LoRa RX and look for the "arrived" message
+void checkLoRaRX() {
+    // Check for incoming data
+    lora.update();
+
+    // Read the data into outStr and store the number of bytes received
+    int recvStatus = lora.readDataByte(outStr);
+  
+    if (recvStatus) {
+        // If new data is received, check if it's the "arrived" message
+        String receivedMessage = "";
+    
+        // Convert the received bytes to a string
+        for (int i = 0; i < recvStatus; i++) {
+            receivedMessage += char(outStr[i]);
+        }
+
+        // Check if the received message is "arrived"
+        if (receivedMessage == "Arrived") {
+            Serial.println("Arrived");
+            isArrived = 1;
+        }
+    }
+}
+
+void sendData(void *pvParameters)
+{
+    // Variables to store the last three sets of latitude and longitude values
+    float lastLat[3] = {0.0, 0.0, 0.0};
+    float lastLon[3] = {0.0, 0.0, 0.0};
+    int sameDataCount = 0;
+
+    for (;;)
+    {
+        if (millis() - previousMillis > interval)
+        {
+            previousMillis = millis();
+            // Check if the current data matches the previous three sets
+            if (latitude == lastLat[0] && latitude == lastLat[1] && latitude == lastLat[2] &&
+                longitude == lastLon[0] && longitude == lastLon[1] && longitude == lastLon[2])
+            {
+                sameDataCount++;
+            }
+            else{
+                sameDataCount = 0;
+            }
+
+            // If the data is the same three times in a row, skip sending
+            if (sameDataCount < 3)
+            {
+                sprintf(myStr, "{\"lat\":%.6f,\"lon\":%.6f,\"t\":\"%s\"}", latitude, longitude, GPStime.c_str());
+                Serial.print("Sending: ");
+                Serial.println(myStr);
+                antares.checkWifiConnection();
+                if(wifiConnected == 0){
+                    lora.sendUplink(myStr, strlen(myStr), 0);
+                    checkLoRaRX();
+                }else if(latitude != 0.0 && longitude != 0.0){
+                    antares.add("lat", latitude);
+                    antares.add("lon", longitude);
+                    antares.add("t", GPStime.c_str());
+                    antares.add("wifi", wifiConnected);
+                    antares.send(projectName, deviceName);
+                }
+                transmission++;
+
+                // Update the last three sets of latitude and longitude values
+                lastLat[2] = lastLat[1];
+                lastLat[1] = lastLat[0];
+                lastLat[0] = latitude;
+
+                lastLon[2] = lastLon[1];
+                lastLon[1] = lastLon[0];
+                lastLon[0] = longitude;
+            }
+        }
+        vTaskDelay(3000 / portTICK_PERIOD_MS); // Delay for 3000 seconds
+    }
+}
+
+// Task to check internet connection
+void internetCheckTask(void *pvParameters) {
+  for (;;) {
+    // Update the global variable based on Wi-Fi connection status
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = 1; // Connected
+    } else {
+      wifiConnected = 0; // Not Connected
+    }
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+  }
+}
+
+void checkArrivalTask(void *pvParameters){
+    for (;;) {
+        if(wifiConnected == 1){
+            antares.get("TestingGround", "UserPhone");
+            if(antares.getSuccess()) {
+                String received = antares.getString("location");
+                Serial.println(received);
+                if (received == "Arrived") {
+                    isArrived = 1;
+                }else{
+                    isArrived = 0;
+                }
+            }
+        }
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+    }
+}
+
+void acknowledge() {
+    isArrived = 0;
+    if(wifiConnected == 0){
+        lora.sendUplink(myStr, strlen(myStr), 0);
+    }else{
+        antares.add("location", "acknowledged");
+        antares.send(projectName, "UserPhone");
+    }
+}
+
+void imuTask(void *pvParameters)
+{
+    for (;;)
+    {
+        // Look for reports from the IMU
+        sensors_event_t a, g, temp;
+        myIMU.getEvent(&a, &g, &temp);
+
+        ax = a.acceleration.x;
+        ay = a.acceleration.y;
+        az = a.acceleration.z;
+
+        vTaskDelay(50 / portTICK_PERIOD_MS); // Delay for 50 ms
+    }
+}
+
+void gpsTask(void *pvParameters)
+{
+    for (;;)
+    {
+        // Read GPS data
+        while (ss.available() > 0)
+        {
+            char c = ss.read();
+            gps.encode(c);
+            // Serial.print(c); // Debug line to print raw GPS data
+
+            if (gps.location.isUpdated())
+            {
+                latitude = gps.location.lat();
+                longitude = gps.location.lng();
+            }
+        
+            if (gps.time.isValid()) {
+                int hour = gps.time.hour();
+                int minute = gps.time.minute();
+                int second = gps.time.second();
+
+                // Adjust to GMT+7
+                hour += 7;
+                if (hour >= 24) {
+                    hour -= 24;
+                    // Optionally, handle date change if needed
+                }
+
+                GPStime = String(hour) + ":" + String(minute) + ":" + String(second);
+            } else {
+                GPStime = "N/A";
+            }
+        }
+
+        vTaskDelay(1000 / portTICK_PERIOD_MS); // Delay for 1000 ms
+    }
+}
+
+void displayTask(void *pvParameters)
+{
+    for (;;)
+    {
+        volt = (analogRead(PIN_BAT_VOLT) * 2 * 3.3) / 4096;
+        lv_label_set_text_fmt(label, "%.2f %.2f %.2f\nLat:%.6f\nLon:%.6f\nTime:%s\nbatVolt:%.2fV\ncounter:%d\nwifi:%d\nArrived:%d",
+                              ax, ay, az, latitude, longitude, GPStime.c_str(), volt, transmission, wifiConnected, isArrived);
+
+        lv_timer_handler(); /* let the GUI do its work */
+        vTaskDelay(50 / portTICK_PERIOD_MS); // Update display every 200 ms
+    }
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    antares.wifiConnection(WIFISSID, PASSWORD);
+    antares.setDebug(true);
+    Wire.begin(IMU_SDA, IMU_SCL);
+
+    if (!myIMU.begin())
+    {
+        Serial.println("Failed to find MPU6050 chip");
+        while (1)
+        {
+            delay(10);
+        }
+    }
+
+    myIMU.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+    Serial.println(F("MPU6050 initialized"));
+    pinMode(PIN_BAT_VOLT, ANALOG);
+
+    // Initialize LVGL
+    lv_init();
+    tft.begin();
+    tft.setRotation(1);
+
+    lv_disp_draw_buf_init(&draw_buf, buf, NULL, screenWidth * 10);
+
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = screenWidth;
+    disp_drv.ver_res = screenHeight;
+    disp_drv.flush_cb = my_disp_flush;
+    disp_drv.draw_buf = &draw_buf;
+    lv_disp_drv_register(&disp_drv);
+
+    label = lv_label_create(lv_scr_act());
+    lv_label_set_text(label, "MPU6050 and GPS Data");
+
+    // Initialize GPS
+    ss.begin(9600);
+
+    // btn_left.attachClick(acknowledge);
+    btn_right.attachClick(acknowledge);
+
+    // Setup LoRaWAN
+    loraSPI.begin(36, 37, 35); // SCK, MISO, MOSI for LoRa
+    if (!lora.init()) {
+        Serial.println("RFM95 not detected");
+        delay(5000);
+        return;
+    }
+
+    lora.setDeviceClass(CLASS_A);
+    lora.setDataRate(SF10BW125);
+    lora.setFramePortTx(5);
+    lora.setChannel(MULTI);
+    lora.setTxPower(15);
+    lora.setNwkSKey(nwkSKey);
+    lora.setAppSKey(appSKey);
+    lora.setDevAddr(devAddr);
+
+    // Create tasks
+    xTaskCreatePinnedToCore(
+        sendData,    // Function to implement the task
+        "SendData",  // Name of the task
+        2048,       // Stack size in words
+        NULL,        // Task input parameter
+        2,           // Priority of the task
+        NULL,        // Task handle
+        1);          // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        checkArrivalTask,    // Function to implement the task
+        "CheckArrivalTask",  // Name of the task
+        4096,       // Stack size in words
+        NULL,        // Task input parameter
+        2,           // Priority of the task
+        NULL,        // Task handle
+        1);          // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        displayTask, // Function to implement the task
+        "DisplayTask", // Name of the task
+        3048,       // Stack size in words
+        NULL,        // Task input parameter
+        1,           // Priority of the task
+        NULL,        // Task handle
+        0);          // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        imuTask, // Function to implement the task
+        "IMUTask", // Name of the task
+        4096,       // Stack size in words
+        NULL,        // Task input parameter
+        1,           // Priority of the task
+        NULL,        // Task handle
+        1);          // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        gpsTask, // Function to implement the task
+        "GPSTask", // Name of the task
+        10000,       // Stack size in words
+        NULL,        // Task input parameter
+        1,           // Priority of the task
+        NULL,        // Task handle
+        1);          // Core where the task should run
+
+    xTaskCreatePinnedToCore(
+        internetCheckTask,    // Function to implement the task
+        "InternetCheckTask",  // Name of the task
+        1024,                 // Stack size in words
+        NULL,                 // Task input parameter
+        1,                    // Priority of the task
+        NULL,
+        0);            
+}
+
+void loop()
+{
+    // btn_left.tick();
+    btn_right.tick();
+}
