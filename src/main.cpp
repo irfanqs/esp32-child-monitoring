@@ -7,6 +7,10 @@
 #include <Adafruit_MPU6050.h>
 #include <Fall_Detection_Model_inferencing.h>
 
+// ESP_ID
+// ganti wm.connectnya juga
+#define DEVICE_ID "nino_003"
+
 // PIN DEFINITION
 #define IMU_SDA 8
 #define IMU_SCL 9
@@ -127,7 +131,7 @@ void sendToAntares(String kondisi) {
   http.addHeader("Accept", "application/json");
 
   // Payload JSON sesuai format yang berhasil
-  String payload = "{\"m2m:cin\": {\"con\": \"{\\\"kondisi\\\":\\\"" + kondisi + "\\\"}\"}}";
+  String payload = "{\"m2m:cin\": {\"con\": \"{\\\"kondisi\\\":\\\"" + kondisi + "\\\",\\\"device_id\\\":\\\"" + String(DEVICE_ID) + "\\\"}\"}}";
   
   Serial.printf("📤 Sending to Antares: %s\n", payload.c_str());
   
@@ -400,7 +404,7 @@ void setup()
   // Jika ingin reset konfigurasi WiFi (misal saat debugging), aktifkan baris ini
   // wm.resetSettings();
 
-  if (!wm.autoConnect("ESP32C3_AP", "12345678")) {
+  if (!wm.autoConnect("Nino003_AP", "12345678")) {
     Serial.println("Step 3: ❌ Failed to connect, restarting...");
     ESP.restart();
     delay(1000);
