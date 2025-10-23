@@ -9,7 +9,8 @@
 
 // ESP_ID
 // ganti wm.connectnya juga
-#define DEVICE_ID "nino_003"
+#define DEVICE_ID "nino_001"
+#define HOTSPOT_SSID "Nino001_AP"
 
 // PIN DEFINITION
 #define IMU_SDA 8
@@ -92,9 +93,9 @@ void playFallAlert() {
   
   // Bunyi 2 kali untuk fall alert
   for (int i = 0; i < 2; i++) {
-    digitalWrite(VIBRATION_PIN, LOW);   // Bunyi ON
+    digitalWrite(VIBRATION_PIN, HIGH);   // Bunyi ON
     delay(400);
-    digitalWrite(VIBRATION_PIN, HIGH);  // Bunyi OFF
+    digitalWrite(VIBRATION_PIN, LOW);  // Bunyi OFF
     if (i < 1) delay(200); // Jeda antar bunyi
   }
   
@@ -291,15 +292,48 @@ void monitorFaintWatch(void *pvParameters) {
 void imuTask(void *pvParameters)
 {
   unsigned long last_interval_ms = 0;
+  bool isWarmedUp = false;
+  unsigned long warmUpStartTime = millis();
+  const unsigned long WARMUP_DURATION = 5000; // 5 detik warm-up
 
   for (;;)
   {
-    // Check if it's time to sample
+    // Warm-up period: isi buffer tapi jangan inferencing dulu
+    if (!isWarmedUp) {
+      if (millis() - warmUpStartTime < WARMUP_DURATION) {
+        if (millis() - last_interval_ms >= INTERVAL_MS) {
+          last_interval_ms = millis();
+          
+          sensors_event_t a, g, temp;
+          myIMU.getEvent(&a, &g, &temp);
+
+          ax = a.acceleration.x;
+          ay = a.acceleration.y;
+          az = a.acceleration.z;
+
+          // Isi buffer tanpa inferencing
+          features[feature_ix++] = -ay;
+          features[feature_ix++] = ax;
+          features[feature_ix++] = az;
+
+          if (feature_ix >= EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+            feature_ix = 0; // Reset buffer
+          }
+        }
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+        continue; // Skip inferencing
+      } else {
+        isWarmedUp = true;
+        feature_ix = 0; // Reset sebelum mulai inferencing
+        Serial.println("🔥 IMU WARM-UP COMPLETED - Fall detection active!");
+      }
+    }
+
+    // Kode inferencing normal (seperti biasa)
     if (millis() - last_interval_ms >= INTERVAL_MS)
     {
       last_interval_ms = millis();
 
-      // Read accelerometer data
       sensors_event_t a, g, temp;
       myIMU.getEvent(&a, &g, &temp);
 
@@ -307,21 +341,16 @@ void imuTask(void *pvParameters)
       ay = a.acceleration.y;
       az = a.acceleration.z;
 
-      // Add accelerometer data to features buffer
       features[feature_ix++] = -ay;
       features[feature_ix++] = ax;
       features[feature_ix++] = az;
 
-      // Check if features buffer is full
       if (feature_ix == EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE)
       {
         ei_impulse_result_t result;
-
-        // Create the signal for inference
         signal_t signal;
         numpy::signal_from_buffer(features, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
 
-        // Run inference
         EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
 
         if (res != 0) {
@@ -330,7 +359,6 @@ void imuTask(void *pvParameters)
           continue;
         }
 
-        // Find the label with the highest probability
         float maxValue = 0.0f;
         int maxIndex = 0;
 
@@ -343,11 +371,9 @@ void imuTask(void *pvParameters)
           }
         }
 
-        // Update the global variable with the highest-valued label
         inferencingResult = result.classification[maxIndex].label;
         
-        // Fall detection dengan threshold yang lebih rendah untuk debugging
-        if (inferencingResult == "Fall" && maxValue > 0.5) // Threshold 50%
+        if (inferencingResult == "Fall" && maxValue > 0.7)
         {
           fallCounter++;
           Serial.printf("🚨 Fall detected! Confidence: %.2f%%, Counter: %d\n", maxValue * 100, fallCounter);
@@ -357,7 +383,7 @@ void imuTask(void *pvParameters)
             Serial.println("🔥 CONFIRMED FALL - Triggering VIBRATION and sending alert!");
             playFallAlert();
             sendToAntares("terjatuh");
-            faintWatch = 1; // Start faint monitoring
+            faintWatch = 1;
             fallCounter = 0;
           }
         }
@@ -372,7 +398,6 @@ void imuTask(void *pvParameters)
         feature_ix = 0;
       }
     }
-    // Allow other tasks to run
     vTaskDelay(1 / portTICK_PERIOD_MS);
   }
 }
@@ -387,7 +412,7 @@ void setup()
 
   // Initialize VIBRATION pin
   pinMode(VIBRATION_PIN, OUTPUT);
-  digitalWrite(VIBRATION_PIN, LOW);  // LOW = diam
+  digitalWrite(VIBRATION_PIN, LOW); 
   Serial.println("Step 1: ✅ VIBRATION initialized");
   
   // Test VIBRATION
@@ -404,7 +429,7 @@ void setup()
   // Jika ingin reset konfigurasi WiFi (misal saat debugging), aktifkan baris ini
   // wm.resetSettings();
 
-  if (!wm.autoConnect("Nino003_AP", "12345678")) {
+  if (!wm.autoConnect(HOTSPOT_SSID, "")) {
     Serial.println("Step 3: ❌ Failed to connect, restarting...");
     ESP.restart();
     delay(1000);
@@ -447,6 +472,13 @@ void setup()
   xTaskCreatePinnedToCore(monitorFaintWatch, "FaintWatchTask", 2048, NULL, 1, NULL, 1);
   
   Serial.println("Step 7: ✅ Tasks created");
+
+  // ========== KIRIM KONDISI START KE ANTARES ==========
+  Serial.println("Step 8: Sending 'start' status to Antares...");
+  sendToAntares("start");
+  delay(1000); 
+  Serial.println("Step 8: ✅ Start status sent");
+
   Serial.println("========================================");
   Serial.println("✅ SYSTEM READY!");
   Serial.println("🔊 VIBRATION: Ready (LOW=diam, HIGH=bunyi)");
@@ -476,7 +508,7 @@ void loop()
     Serial.printf("🎯 Prediction: %s, Fall counter: %d\n", inferencingResult.c_str(), fallCounter);
     Serial.printf("📊 IMU: X:%.2f Y:%.2f Z:%.2f m/s²\n", a.acceleration.x, a.acceleration.y, a.acceleration.z);
     Serial.printf("😴 Faint watch: %s\n", faintWatch ? "Active" : "Inactive");
-    Serial.printf("🔊 VIBRATION: %s\n", digitalRead(VIBRATION_PIN) ? "Diam" : "Bunyi");
+    Serial.printf("🔊 VIBRATION: %s\n", digitalRead(VIBRATION_PIN) ? "Bunyi" : "Diam");
     Serial.println("===================================\n");
   }
   
