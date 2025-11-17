@@ -1,6 +1,5 @@
 #include <Wire.h>
 #include <WiFi.h>
-#include <WiFiManager.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Adafruit_Sensor.h>
@@ -23,6 +22,11 @@
 #define ANTARES_DEVICE "esp32"
 #define ANTARES_URL "https://platform.antares.id:8443/~/antares-cse/antares-id/" ANTARES_APPLICATION "/" ANTARES_DEVICE
 
+// =====================
+// Hardcoded WiFi config
+#define WIFI_SSID "MI MIFTAHUR ROHMAT"
+#define WIFI_PASSWORD "MI MIFTAHUR ROHMAT"
+// =====================
 // Fall Detection Variables
 Adafruit_MPU6050 myIMU;
 float ax, ay, az;
@@ -423,18 +427,35 @@ void setup()
   Serial.println("Step 2: ✅ VIBRATION test completed");
 
   // Initialize WiFi via WiFiManager
-  Serial.println("Step 3: Starting WiFiManager...");
-  WiFiManager wm;
+  // Initialize WiFi: try hardcoded credentials first (if provided), otherwise fall back to WiFiManager
+  Serial.println("Step 3: Starting WiFi (hardcoded only)...");
 
-  // Jika ingin reset konfigurasi WiFi (misal saat debugging), aktifkan baris ini
-  // wm.resetSettings();
-
-  if (!wm.autoConnect(HOTSPOT_SSID, "")) {
-    Serial.println("Step 3: ❌ Failed to connect, restarting...");
+  // Jika menggunakan mode tanpa WiFiManager, wajib mengisi WIFI_SSID.
+  if (strlen(WIFI_SSID) == 0) {
+    Serial.println("Step 3: ❌ WIFI_SSID kosong - tidak ada mekanisme konfigurasi captive portal karena WiFiManager dihapus.");
+    Serial.println("Silakan isi WIFI_SSID dan WIFI_PASSWORD di src/main.cpp atau gunakan metode lain untuk memasukkan kredensial.");
+    delay(5000);
     ESP.restart();
-    delay(1000);
+    return;
+  }
+
+  Serial.printf("Step 3: Trying hardcoded WiFi SSID: %s\n", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startAttemptTime = millis();
+  // wait up to 30 seconds for connection
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nStep 3: ✅ WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
   } else {
-    Serial.printf("Step 3: ✅ WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.println("\nStep 3: ❌ Hardcoded WiFi failed to connect within timeout. Restarting...");
+    delay(2000);
+    ESP.restart();
+    return;
   }
 
   // Initialize I2C
