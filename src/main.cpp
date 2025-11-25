@@ -7,9 +7,7 @@
 #include <Fall_Detection_Model_inferencing.h>
 
 // ESP_ID
-// ganti wm.connectnya juga
-#define DEVICE_ID "nino_001"
-#define HOTSPOT_SSID "Nino001_AP"
+#define DEVICE_ID "nino_002"
 
 // PIN DEFINITION
 #define IMU_SDA 8
@@ -413,6 +411,7 @@ void setup()
   Serial.println("\n\n========================================");
   Serial.println("  FALL DETECTION + ANTARES SYSTEM");
   Serial.println("========================================");
+  Serial.printf("Device ID: %s\n", DEVICE_ID);
 
   // Initialize VIBRATION pin
   pinMode(VIBRATION_PIN, OUTPUT);
