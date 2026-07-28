@@ -1,29 +1,39 @@
 #include <Wire.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_MPU6050.h>
 #include <Fall_Detection_Model_inferencing.h>
 
 // ESP_ID
-#define DEVICE_ID "nino_002"
+#define DEVICE_ID "nino_001"
 
 // PIN DEFINITION
 #define IMU_SDA 8
 #define IMU_SCL 9
 #define VIBRATION_PIN 3
 
-// Antares Configuration
-#define ANTARES_ACCESS_KEY "8183f9d73fe936db:40ab0de1a828f251"
-#define ANTARES_APPLICATION "testbeneran"
-#define ANTARES_DEVICE "esp32"
-#define ANTARES_URL "https://platform.antares.id:8443/~/antares-cse/antares-id/" ANTARES_APPLICATION "/" ANTARES_DEVICE
+// MQTT Configuration (HiveMQ Cloud)
+const char* mqtt_server    = "c634c8c1cdf54935970298ed1add5ed7.s1.eu.hivemq.cloud";
+const int   mqtt_port      = 8883;
+const char* mqtt_client_id = "ESP32_Main_Controller";
+const char* mqtt_user      = "irfanqs";
+const char* mqtt_pass      = "Irfan123";
+
+// MQTT Topics
+const String TOPIC_STATUS  = String("nino/") + String(DEVICE_ID) + "/status";
+const String TOPIC_COMMAND = String("nino/") + String(DEVICE_ID) + "/command";
+
+// WiFi & MQTT Clients
+WiFiClientSecure espClient;
+PubSubClient mqttClient(espClient);
 
 // =====================
 // Hardcoded WiFi config
-#define WIFI_SSID "MI MIFTAHUR ROHMAT"
-#define WIFI_PASSWORD "MI MIFTAHUR ROHMAT"
+#define WIFI_SSID "J2 Prime Turbo"
+#define WIFI_PASSWORD "Qobus123"
 // =====================
 // Fall Detection Variables
 Adafruit_MPU6050 myIMU;
@@ -41,24 +51,79 @@ size_t feature_ix = 0;
 // Faint Detection Variables
 #define FAINT_CHECK_DURATION_MS 30000 // 30 detik untuk deteksi pingsan
 volatile int faintWatch = 0;          // Global variable to trigger faint check
-unsigned long lastAntaresCheck = 0;
-const unsigned long ANTARES_CHECK_INTERVAL = 10000; // Check setiap 10 detik
 
 // Parent Alert Variables
-String lastProcessedData = "";         // Menyimpan data terakhir yang sudah diproses
-unsigned long lastParentAlertTime = 0; // Timestamp alert terakhir
+unsigned long lastParentAlertTime = 0;
 const unsigned long PARENT_ALERT_COOLDOWN = 60000; // Cooldown 60 detik untuk parent alert
+
+// MQTT Reconnection
+unsigned long lastMqttReconnectAttempt = 0;
+const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
+
+// Forward declarations
+void playFallAlert();
+void playParentAlert();
+void sendStatus(String kondisi);
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  char payloadStr[length + 1];
+  memcpy(payloadStr, payload, length);
+  payloadStr[length] = '\0';
+
+  Serial.printf("📥 MQTT message received on topic: %s\n", topic);
+  Serial.printf("📥 Payload: %s\n", payloadStr);
+
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, payloadStr);
+
+  if (error) {
+    Serial.printf("❌ JSON parse error: %s\n", error.c_str());
+    return;
+  }
+
+  const char* posisiOrtu = doc["posisi_ortu_dekat"];
+
+  if (posisiOrtu && strcmp(posisiOrtu, "ya") == 0) {
+    if (millis() - lastParentAlertTime < PARENT_ALERT_COOLDOWN) {
+      Serial.printf("⏰ Parent alert masih dalam cooldown (%lu ms remaining)\n",
+                    PARENT_ALERT_COOLDOWN - (millis() - lastParentAlertTime));
+    } else {
+      Serial.println("🚨 Parent nearby detected! Playing parent alert...");
+      playParentAlert();
+      lastParentAlertTime = millis();
+    }
+  }
+}
+
+bool mqttConnect() {
+  Serial.printf("📡 Connecting to MQTT: %s:%d... ", mqtt_server, mqtt_port);
+
+  espClient.setInsecure();
+
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+
+  if (mqttClient.connect(mqtt_client_id, mqtt_user, mqtt_pass)) {
+    Serial.println("✅ Connected to HiveMQ Cloud!");
+    mqttClient.subscribe(TOPIC_COMMAND.c_str());
+    Serial.printf("📡 Subscribed to: %s\n", TOPIC_COMMAND.c_str());
+    return true;
+  } else {
+    Serial.printf("❌ Failed (rc=%d)\n", mqttClient.state());
+    return false;
+  }
+}
 
 // I2C Scanner function
 void scanI2C() {
   Serial.println("🔍 Scanning I2C devices...");
   byte error, address;
   int nDevices = 0;
-  
+
   for(address = 1; address < 127; address++) {
     Wire.beginTransmission(address);
     error = Wire.endTransmission();
-    
+
     if (error == 0) {
       Serial.printf("✅ I2C device found at address 0x%02X\n", address);
       nDevices++;
@@ -66,12 +131,12 @@ void scanI2C() {
       Serial.printf("❓ Unknown error at address 0x%02X\n", address);
     }
   }
-  
+
   if (nDevices == 0) {
     Serial.println("❌ No I2C devices found!");
     Serial.println("🔧 Check wiring:");
     Serial.println("   - VCC to 3.3V");
-    Serial.println("   - GND to GND"); 
+    Serial.println("   - GND to GND");
     Serial.println("   - SDA to pin 8");
     Serial.println("   - SCL to pin 9");
   } else {
@@ -80,19 +145,19 @@ void scanI2C() {
   Serial.println("");
 }
 
-// VIBRATION function untuk VIBRATION aktif (LOW = bunyi, HIGH = diam)
+// VIBRATION function untuk VIBRATION aktif (LOW = diam, HIGH = bunyi)
 void playFallAlert() {
   Serial.println("DEBUG: playFallAlert() called");
-  
+
   // Cek cooldown period
   if (millis() - lastVIBRATIONTime < VIBRATION_COOLDOWN) {
-    Serial.printf("⏰ VIBRATION masih dalam cooldown period (%lu ms remaining)\n", 
+    Serial.printf("⏰ VIBRATION masih dalam cooldown period (%lu ms remaining)\n",
                   VIBRATION_COOLDOWN - (millis() - lastVIBRATIONTime));
     return;
   }
-  
+
   Serial.println("🔊 === FALL ALERT ACTIVATED ===");
-  
+
   // Bunyi 2 kali untuk fall alert
   for (int i = 0; i < 2; i++) {
     digitalWrite(VIBRATION_PIN, HIGH);   // Bunyi ON
@@ -100,14 +165,14 @@ void playFallAlert() {
     digitalWrite(VIBRATION_PIN, LOW);  // Bunyi OFF
     if (i < 1) delay(200); // Jeda antar bunyi
   }
-  
+
   lastVIBRATIONTime = millis();
   Serial.println("🔊 === VIBRATION ALERT COMPLETED ===");
 }
 
 void playParentAlert() {
   Serial.println("🔊 === PARENT NEARBY ALERT ===");
-  
+
   // Bunyi 10 kali untuk parent alert
   for (int i = 0; i < 10; i++) {
     digitalWrite(VIBRATION_PIN, HIGH);   // Bunyi ON
@@ -115,121 +180,39 @@ void playParentAlert() {
     digitalWrite(VIBRATION_PIN, LOW);  // Bunyi OFF
     if (i < 9) delay(150); // Jeda antar bunyi
   }
-  
+
   Serial.println("🔊 === PARENT ALERT COMPLETED ===");
 }
 
-void sendToAntares(String kondisi) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("❌ WiFi not connected, cannot send to Antares");
+void sendStatus(String kondisi) {
+  if (!mqttClient.connected()) {
+    Serial.println("❌ MQTT not connected, cannot send status");
     return;
   }
 
-  HTTPClient http;
-  http.begin(ANTARES_URL);
-  
-  // Header sesuai format yang berhasil
-  http.addHeader("X-M2M-Origin", ANTARES_ACCESS_KEY);
-  http.addHeader("Content-Type", "application/json;ty=4");  // Ubah dari ty=3 ke ty=4
-  http.addHeader("Accept", "application/json");
+  StaticJsonDocument<192> doc;
+  doc["kondisi"] = kondisi;
+  doc["device_id"] = DEVICE_ID;
 
-  // Payload JSON sesuai format yang berhasil
-  String payload = "{\"m2m:cin\": {\"con\": \"{\\\"kondisi\\\":\\\"" + kondisi + "\\\",\\\"device_id\\\":\\\"" + String(DEVICE_ID) + "\\\"}\"}}";
-  
-  Serial.printf("📤 Sending to Antares: %s\n", payload.c_str());
-  
-  int httpResponseCode = http.POST(payload);
-  
-  if (httpResponseCode > 0) {
-    String response = http.getString();
-    Serial.printf("✅ Antares response: %d - %s\n", httpResponseCode, response.c_str());
+  char buffer[192];
+  size_t n = serializeJson(doc, buffer);
+
+  bool result = mqttClient.publish(TOPIC_STATUS.c_str(), buffer);
+
+  if (result) {
+    Serial.printf("📤 Published to %s: %s\n", TOPIC_STATUS.c_str(), buffer);
   } else {
-    Serial.printf("❌ Antares error: %d\n", httpResponseCode);
+    Serial.printf("❌ Failed to publish to %s\n", TOPIC_STATUS.c_str());
   }
-  
-  http.end();
-}
-
-void checkAntaresDownlink() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  HTTPClient http;
-  // URL untuk mendapatkan data terbaru (latest data)
-  String downlinkURL = String(ANTARES_URL) + "/la";
-  http.begin(downlinkURL);
-  
-  // Header untuk GET request
-  http.addHeader("X-M2M-Origin", ANTARES_ACCESS_KEY);
-  http.addHeader("Accept", "application/json");
-  
-  int httpResponseCode = http.GET();
-  
-  if (httpResponseCode == 200) {
-    String payload = http.getString();
-    
-    // Cek apakah payload sama dengan yang terakhir diproses
-    if (payload == lastProcessedData) {
-      Serial.println("📥 Same data as before, skipping processing");
-      http.end();
-      return;
-    }
-    
-    Serial.printf("📥 Antares downlink (new): %s\n", payload.c_str());
-    
-    // Parse JSON untuk cek posisi_ortu_dekat
-    StaticJsonDocument<1000> doc;
-    DeserializationError error = deserializeJson(doc, payload);
-    
-    if (!error) {
-      // Cek berbagai path yang mungkin dalam response Antares
-      String posisiOrtu = "";
-      
-      // Cek format response Antares yang berbeda-beda
-      if (doc["m2m:cin"]["con"]["posisi_ortu_dekat"]) {
-        posisiOrtu = doc["m2m:cin"]["con"]["posisi_ortu_dekat"].as<String>();
-      } else if (doc["m2m:cin"]["con"].is<String>()) {
-        String conString = doc["m2m:cin"]["con"].as<String>();
-        // Parse jika con berisi JSON string
-        StaticJsonDocument<200> conDoc;
-        DeserializationError conError = deserializeJson(conDoc, conString);
-        if (!conError && conDoc["posisi_ortu_dekat"]) {
-          posisiOrtu = conDoc["posisi_ortu_dekat"].as<String>();
-        }
-      }
-      
-      if (posisiOrtu == "ya") {
-        // Cek cooldown untuk parent alert
-        if (millis() - lastParentAlertTime < PARENT_ALERT_COOLDOWN) {
-          Serial.printf("⏰ Parent alert masih dalam cooldown (%lu ms remaining)\n", 
-                        PARENT_ALERT_COOLDOWN - (millis() - lastParentAlertTime));
-        } else {
-          Serial.println("🚨 Parent nearby detected! Playing parent alert...");
-          playParentAlert();
-          lastParentAlertTime = millis();
-        }
-      }
-      
-      // Simpan payload sebagai data terakhir yang diproses
-      lastProcessedData = payload;
-    } else {
-      Serial.printf("❌ JSON parsing error: %s\n", error.c_str());
-    }
-  } else {
-    Serial.printf("❌ Downlink error: %d\n", httpResponseCode);
-  }
-  
-  http.end();
 }
 
 void faintCheck(void *pvParameters) {
   const float JERK_THRESHOLD = 35;
   const int SAMPLE_INTERVAL_MS = 100;
   unsigned long startTime = millis();
-  
+
   float prevAccX = 0.0, prevAccY = 0.0, prevAccZ = 0.0;
-  
+
   Serial.println("⏱️ Faint check started - monitoring for 30 seconds...");
 
   while (1) {
@@ -238,11 +221,10 @@ void faintCheck(void *pvParameters) {
     float acceleration_g_z = az;
 
     if (prevAccX != 0.0 || prevAccY != 0.0 || prevAccZ != 0.0) {
-      // Calculate jerk (change in acceleration over time)
       float jerkX = (acceleration_g_x - prevAccX) / (SAMPLE_INTERVAL_MS / 1000.0);
       float jerkY = (acceleration_g_y - prevAccY) / (SAMPLE_INTERVAL_MS / 1000.0);
       float jerkZ = (acceleration_g_z - prevAccZ) / (SAMPLE_INTERVAL_MS / 1000.0);
-      
+
       float jerkMagnitude = sqrt(jerkX * jerkX + jerkY * jerkY + jerkZ * jerkZ);
 
       if (jerkMagnitude > JERK_THRESHOLD) {
@@ -251,15 +233,14 @@ void faintCheck(void *pvParameters) {
         vTaskDelete(NULL);
       }
     }
-    
+
     prevAccX = acceleration_g_x;
     prevAccY = acceleration_g_y;
     prevAccZ = acceleration_g_z;
 
-    // Check if 30 seconds have passed
     if (millis() - startTime >= FAINT_CHECK_DURATION_MS) {
       Serial.println("🚨 No significant movement for 30 seconds - FAINTING DETECTED!");
-      sendToAntares("pingsan");
+      sendStatus("pingsan");
       faintWatch = 0;
       vTaskDelete(NULL);
     }
@@ -274,14 +255,13 @@ void monitorFaintWatch(void *pvParameters) {
       Serial.println("⏱️ faintWatch activated. Waiting 6 seconds before monitoring...");
       vTaskDelay(6000 / portTICK_PERIOD_MS);
 
-      // Create the faintCheck task
       xTaskCreatePinnedToCore(
-        faintCheck,   
-        "FaintCheck", 
-        4096,         
-        NULL,         
-        1,            
-        NULL,         
+        faintCheck,
+        "FaintCheck",
+        4096,
+        NULL,
+        1,
+        NULL,
         1);
 
       faintWatch = 0;
@@ -300,12 +280,11 @@ void imuTask(void *pvParameters)
 
   for (;;)
   {
-    // Warm-up period: isi buffer tapi jangan inferencing dulu
     if (!isWarmedUp) {
       if (millis() - warmUpStartTime < WARMUP_DURATION) {
         if (millis() - last_interval_ms >= INTERVAL_MS) {
           last_interval_ms = millis();
-          
+
           sensors_event_t a, g, temp;
           myIMU.getEvent(&a, &g, &temp);
 
@@ -313,25 +292,23 @@ void imuTask(void *pvParameters)
           ay = a.acceleration.y;
           az = a.acceleration.z;
 
-          // Isi buffer tanpa inferencing
           features[feature_ix++] = -ay;
           features[feature_ix++] = ax;
           features[feature_ix++] = az;
 
           if (feature_ix >= EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
-            feature_ix = 0; // Reset buffer
+            feature_ix = 0;
           }
         }
         vTaskDelay(1 / portTICK_PERIOD_MS);
-        continue; // Skip inferencing
+        continue;
       } else {
         isWarmedUp = true;
-        feature_ix = 0; // Reset sebelum mulai inferencing
+        feature_ix = 0;
         Serial.println("🔥 IMU WARM-UP COMPLETED - Fall detection active!");
       }
     }
 
-    // Kode inferencing normal (seperti biasa)
     if (millis() - last_interval_ms >= INTERVAL_MS)
     {
       last_interval_ms = millis();
@@ -374,17 +351,17 @@ void imuTask(void *pvParameters)
         }
 
         inferencingResult = result.classification[maxIndex].label;
-        
+
         if (inferencingResult == "Fall" && maxValue > 0.7)
         {
           fallCounter++;
           Serial.printf("🚨 Fall detected! Confidence: %.2f%%, Counter: %d\n", maxValue * 100, fallCounter);
-          
+
           if (fallCounter >= 1)
           {
             Serial.println("🔥 CONFIRMED FALL - Triggering VIBRATION and sending alert!");
             playFallAlert();
-            sendToAntares("terjatuh");
+            sendStatus("terjatuh");
             faintWatch = 1;
             fallCounter = 0;
           }
@@ -392,7 +369,7 @@ void imuTask(void *pvParameters)
         else
         {
           if (fallCounter > 0) {
-            Serial.printf("⚠️ Resetting fall counter - Current: %s (%.1f%%)\n", 
+            Serial.printf("⚠️ Resetting fall counter - Current: %s (%.1f%%)\n",
                          inferencingResult.c_str(), maxValue * 100);
           }
           fallCounter = 0;
@@ -409,15 +386,17 @@ void setup()
   Serial.begin(115200);
   delay(3000);
   Serial.println("\n\n========================================");
-  Serial.println("  FALL DETECTION + ANTARES SYSTEM");
+  Serial.println("  FALL DETECTION + HIVEMQ MQTT SYSTEM");
   Serial.println("========================================");
   Serial.printf("Device ID: %s\n", DEVICE_ID);
+  Serial.printf("MQTT Status Topic: %s\n", TOPIC_STATUS.c_str());
+  Serial.printf("MQTT Command Topic: %s\n", TOPIC_COMMAND.c_str());
 
   // Initialize VIBRATION pin
   pinMode(VIBRATION_PIN, OUTPUT);
-  digitalWrite(VIBRATION_PIN, LOW); 
+  digitalWrite(VIBRATION_PIN, LOW);
   Serial.println("Step 1: ✅ VIBRATION initialized");
-  
+
   // Test VIBRATION
   Serial.println("Step 2: Testing VIBRATION...");
   digitalWrite(VIBRATION_PIN, HIGH);
@@ -426,10 +405,8 @@ void setup()
   Serial.println("Step 2: ✅ VIBRATION test completed");
 
   // Initialize WiFi via WiFiManager
-  // Initialize WiFi: try hardcoded credentials first (if provided), otherwise fall back to WiFiManager
   Serial.println("Step 3: Starting WiFi (hardcoded only)...");
 
-  // Jika menggunakan mode tanpa WiFiManager, wajib mengisi WIFI_SSID.
   if (strlen(WIFI_SSID) == 0) {
     Serial.println("Step 3: ❌ WIFI_SSID kosong - tidak ada mekanisme konfigurasi captive portal karena WiFiManager dihapus.");
     Serial.println("Silakan isi WIFI_SSID dan WIFI_PASSWORD di src/main.cpp atau gunakan metode lain untuk memasukkan kredensial.");
@@ -442,7 +419,6 @@ void setup()
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long startAttemptTime = millis();
-  // wait up to 30 seconds for connection
   while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) {
     Serial.print(".");
     delay(500);
@@ -457,15 +433,24 @@ void setup()
     return;
   }
 
+  // Initialize MQTT
+  Serial.println("Step 4: Connecting to HiveMQ Cloud...");
+  mqttClient.setCallback(mqttCallback);
+  if (mqttConnect()) {
+    Serial.println("Step 4: ✅ MQTT connected!");
+  } else {
+    Serial.printf("Step 4: ⚠️ MQTT connection failed (rc=%d), will retry in loop\n", mqttClient.state());
+  }
+
   // Initialize I2C
   Wire.begin(IMU_SDA, IMU_SCL);
-  Serial.printf("Step 4: ✅ I2C initialized (SDA:%d, SCL:%d)\n", IMU_SDA, IMU_SCL);
-  
+  Serial.printf("Step 5: ✅ I2C initialized (SDA:%d, SCL:%d)\n", IMU_SDA, IMU_SCL);
+
   // Scan for I2C devices
   scanI2C();
 
   // Initialize MPU6050
-  Serial.print("Step 5: Initializing MPU6050... ");
+  Serial.print("Step 6: Initializing MPU6050... ");
   if (!myIMU.begin()) {
     Serial.println("❌ FAILED!");
     Serial.println("🔧 Troubleshooting steps:");
@@ -474,69 +459,79 @@ void setup()
     Serial.println("3. Check power supply (3.3V)");
     Serial.println("4. Try different I2C pins if needed");
     Serial.println("⚠️ Continuing without MPU6050 - Fall detection disabled");
-    
-    // Continue without MPU6050 for debugging
+
     delay(2000);
   } else {
     Serial.println("✅ SUCCESS!");
-    
-    // Configure MPU6050
+
     myIMU.setFilterBandwidth(MPU6050_BAND_10_HZ);
     myIMU.setAccelerometerRange(MPU6050_RANGE_8_G);
     myIMU.setGyroRange(MPU6050_RANGE_1000_DEG);
-    Serial.println("Step 6: ✅ MPU6050 configured");
+    Serial.println("Step 7: ✅ MPU6050 configured");
   }
 
   // Create tasks
   xTaskCreatePinnedToCore(imuTask, "IMUTask", 4096, NULL, 3, NULL, 1);
   xTaskCreatePinnedToCore(monitorFaintWatch, "FaintWatchTask", 2048, NULL, 1, NULL, 1);
-  
-  Serial.println("Step 7: ✅ Tasks created");
 
-  // ========== KIRIM KONDISI START KE ANTARES ==========
-  Serial.println("Step 8: Sending 'start' status to Antares...");
-  sendToAntares("start");
-  delay(1000); 
-  Serial.println("Step 8: ✅ Start status sent");
+  Serial.println("Step 8: ✅ Tasks created");
+
+  // Kirim status start
+  Serial.println("Step 9: Sending 'start' status via MQTT...");
+  sendStatus("start");
+  delay(1000);
+  Serial.println("Step 9: ✅ Start status sent");
 
   Serial.println("========================================");
   Serial.println("✅ SYSTEM READY!");
   Serial.println("🔊 VIBRATION: Ready (LOW=diam, HIGH=bunyi)");
   Serial.print("📡 WiFi: ");
   Serial.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+  Serial.print("☁️ MQTT: ");
+  Serial.println(mqttClient.connected() ? "Connected" : "Disconnected");
   Serial.println("📊 IMU: Ready");
   Serial.println("🚨 Fall Detection: Active");
   Serial.println("😴 Faint Detection: Active");
-  Serial.println("☁️ Antares Integration: Ready");
-  Serial.printf("🌐 Antares URL: %s\n", ANTARES_URL);
+  Serial.printf("📡 MQTT Server: %s:%d\n", mqtt_server, mqtt_port);
+  Serial.printf("📤 Status Topic: %s\n", TOPIC_STATUS.c_str());
+  Serial.printf("📥 Command Topic: %s\n", TOPIC_COMMAND.c_str());
   Serial.println("========================================\n");
 }
 
 void loop()
 {
+  // Maintain MQTT connection
+  if (!mqttClient.connected()) {
+    unsigned long now = millis();
+    if (now - lastMqttReconnectAttempt > MQTT_RECONNECT_INTERVAL) {
+      lastMqttReconnectAttempt = now;
+      Serial.println("⚠️ MQTT disconnected, attempting reconnect...");
+      if (mqttConnect()) {
+        Serial.println("✅ MQTT reconnected!");
+      }
+    }
+  } else {
+    mqttClient.loop();
+  }
+
   // Status monitoring setiap 5 detik
   static unsigned long lastStatusUpdate = 0;
   if (millis() - lastStatusUpdate > 5000) {
     lastStatusUpdate = millis();
-    
+
     sensors_event_t a, g, temp;
     myIMU.getEvent(&a, &g, &temp);
-    
+
     Serial.println("========== SYSTEM STATUS ==========");
     Serial.printf("⏱️  Uptime: %lu seconds\n", millis()/1000);
     Serial.printf("📡 WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+    Serial.printf("☁️ MQTT: %s\n", mqttClient.connected() ? "Connected" : "Disconnected");
     Serial.printf("🎯 Prediction: %s, Fall counter: %d\n", inferencingResult.c_str(), fallCounter);
     Serial.printf("📊 IMU: X:%.2f Y:%.2f Z:%.2f m/s²\n", a.acceleration.x, a.acceleration.y, a.acceleration.z);
     Serial.printf("😴 Faint watch: %s\n", faintWatch ? "Active" : "Inactive");
     Serial.printf("🔊 VIBRATION: %s\n", digitalRead(VIBRATION_PIN) ? "Bunyi" : "Diam");
     Serial.println("===================================\n");
   }
-  
-  // Check Antares downlink setiap 10 detik
-  if (millis() - lastAntaresCheck > ANTARES_CHECK_INTERVAL) {
-    lastAntaresCheck = millis();
-    checkAntaresDownlink();
-  }
-  
-  delay(1000);
+
+  delay(100);
 }
